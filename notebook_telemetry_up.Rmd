@@ -1,0 +1,635 @@
+---
+title: "Uptime analysis of a cloud-based telemetry system"
+output:
+  html_notebook:
+    fig_caption: yes
+  html_document:
+    df_print: paged
+  pdf_document: default
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+## Objectives:
+The objective of this project is to identify the most problematic devices in a cloud-based telemetry system. <br>
+The analysis will have to satisfy the following requirements: 
+
+<li> Produce an analysis and report of devices uptime for 24h in 15 min intervals </li>
+<li> For devices with an uptime below 97%, report the 2 most common alarms. </li>
+<li> Uptime definition:
+$$
+uptime = 100 * (1 - \frac{int.\ with \ NA + int. \ with \ alarms - int.\ with \  maintenance \ alarms}{total \ active \ intervals})
+$$ </li>
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# upload libraries
+packages <- c("tidyverse", "dplyr","knitr", "ggplot2", "RSQLite", "DBI", "RMySQL", "lubridate", "plotly", "hrbrthemes", "ggthemes","Boruta", "patchwork")
+lapply(packages, require, character.only = TRUE)
+```
+
+### Source SQL data
+
+<ol>
+
+<li>Import the "technicall_assessment.sql" into a SQL database</li>
+
+<li>Pull the SQL tables into into R dataframes</li>
+
+<li>Operate within R as on a dataframe</li>
+
+</ol>
+
+```{r message=FALSE, warning=FALSE}
+# Pulling data from SQL
+# Establish a connection to MySQL
+con <- dbConnect(MySQL(), user = "root", password = "1234", dbname = "telemetry_data", host = "localhost")
+
+# Query the data
+devices_gateway_1 <- dbGetQuery(con, "SELECT * FROM devices_gateway_1")
+devices_gateway_2 <- dbGetQuery(con, "SELECT * FROM devices_gateway_2")
+devices_gateway_3 <- dbGetQuery(con, "SELECT * FROM devices_gateway_3")
+gateway_1 <- dbGetQuery(con, "SELECT * FROM gateway_1")
+gateway_2 <- dbGetQuery(con, "SELECT * FROM gateway_2")
+gateway_3 <- dbGetQuery(con, "SELECT * FROM gateway_3")
+
+# Close the connection
+dbDisconnect(con)
+```
+
+The database telemetry_data contains six tables. I import them all. From
+the instructions given  I assume only devices_gateway (1,2,3) are
+relevant. <br>
+Data has 1 minute frequency by device. <br> 
+<b>Objective 1: </b> Create an uptime variable aggregated in 15 minutes intervals.
+
+### Data manipulation
+
+Two approaches:
+
+<ol>
+
+<li>Work on the single tables: lighter and faster but more coding
+demanding</li>
+
+<li>Join tables into a single df: slower but less coding demanding</li>
+
+<ol>
+
+#### Steps:
+
+<ol>
+
+<li><b>Create a gateway-device ID</b></li>
+
+Data enter frm different point of access. Some device_id are duplicated
+in devices_gateway_1 and 2. <br> Thus, following approach 1, I create a
+gateway_device_id \<- ID. Also change date format and order datasets by
+ID and time.
+
+```{r}
+# Create a device identifier by gateway: as devices are repeated across gateways
+
+# Create a list of datasets
+datasets <- list(devices_gateway_1, devices_gateway_2, devices_gateway_3)
+
+# Loop through each dataset
+for (i in seq_along(datasets)) {
+  # Extract gateway number
+  gateway_number <- i
+
+  # Add ID column on every dataset
+  datasets[[i]] <- mutate(datasets[[i]], ID = paste(gateway_number, device_id, sep = "_")) %>%
+    relocate(ID, .after = utc_datetime)
+
+  # Change date format
+  datasets[[i]]$utc_datetime <- as.POSIXct(datasets[[i]]$utc_datetime)
+
+  # Order entries by date and ID
+  datasets[[i]] <- datasets[[i]] %>%
+    arrange(ID, utc_datetime)
+}
+```
+
+Next, for easiness, I join the three tables into a single df.
+
+```{r}
+# Combine the processed datasets into a single dataframe to simplify visualization and manipulation
+combined_dataset <- do.call(rbind, datasets)
+# Select relevant dataset
+data <- combined_dataset
+```
+
+<li><b>Check the date structure</b></li>
+
+The joined dataframe contains 264 devices. Each device should collect
+data with 1 minute frequency.
+
+```{r}
+# number f devices
+length(unique(data$ID))
+```
+
+There are breaks in the utc_datetime variable. Some devices "skip" some
+minutes. <br> As missing data are relevant for uptime calculation, I
+introduce empty lines for the missing points of time <em> by ID groups
+</em>.
+
+```{r}
+# Step 1: Identify the complete range of timestamps for each device_id
+# It creates a list of timestamps for the 267 devices_gateway
+complete_ranges <- by(data, data$ID, function(x) {
+  min_time <- min(x$utc_datetime)
+  max_time <- max(x$utc_datetime)
+  seq(min_time, max_time, by = "min")
+})
+
+# Step 2: Create a template data frame with all timestamps within the identified range
+template_df <- do.call(rbind, lapply(complete_ranges, function(x) {
+  data.frame(utc_datetime = x)
+}))
+
+# Add device_id to the template data frame
+template_df$ID <- rep(names(complete_ranges), sapply(complete_ranges, length))
+
+# Step 3: Merge the template data frame with original data, filling missing values with NA
+merged_df <- merge(template_df, data, by = c("utc_datetime", "ID"), all.x = TRUE)
+
+# If you want to order the merged data frame by device_id and utc_datetime
+merged_df <- merged_df[order(merged_df$ID, merged_df$utc_datetime), ]
+
+# Now the missing observations I added should contain all nas in columns 3:16
+all_na_rows <- merged_df %>%
+  ungroup() %>%
+  filter(rowSums(is.na(select(., 3:16))) == 14)
+
+data <- merged_df
+```
+
+I display the introduced missing points:
+
+```{r}
+all_na_rows
+```
+
+Next, I still need a day and interval identifier <br> I introduce a ID for the day
+number since the start of the analysis: 23-10.<br> 
+Below is displayed the look of the dataset after this data manipulation. 
+
+```{r}
+# Create a variable for the day number
+data <- data %>%
+  mutate(day = as.integer(date(utc_datetime) - min(date(utc_datetime))) + 1) %>%
+  relocate(day, .after = utc_datetime)
+
+# Create a variable for the interval number within each day
+data$interval <- 1 + ((hour(data$utc_datetime) * 60 + minute(data$utc_datetime)) %/% 15)
+data <- data %>%
+  relocate(interval, .after = utc_datetime)
+
+print(data)
+```
+Dataset descriptives:
+```{r, fig.width=10}
+data.frame(
+  Variable = c("utc_datetime","interval","day","ID","device_id","Alarms1","Alarms2","PanelVoltage_mV" , "Position_a1_rad" , "MotorCurrent_a1_mA" ,"MotorCurrentPeak_a1_mA", "TargetAngle_a1_rad", "PanelCurrent_mA" ,    "MaxError","StateOfCharge"  ,    "Voltage_mV"   ,  "StateOfHealth",      "MainState",      "SafePositionState"),
+  Nr_Obs = c(2676823,2676823,2676823,2676823,2676823,2676823,2676823,2676823,2676823,2676823,2676823,2676823,2676823,2676823,2676823,2676823,2676823,2676823,2676823),
+  Min = c("2023-10-23 00:00:00.00",1,1,"1_1",1,0,0,0,-0.9,0,0,-0.9,0,0,0,0,0,0,0),
+  Max = c("2023-10-29 23:59:00.00",96,7,"3_127",137,16384,260,49025,0.9,2761,3391,0.9,849,255,100,49025,0,2,1)
+)
+```
+
+
+<li><b>Uptime variable calculation</b></li>
+
+$$
+uptime = 100 * (1 - \frac{int.\ with \ NA + int. \ with \ alarms - int.\ with \  maintenance \ alarms}{total \ active \ intervals})
+$$
+According to the info received, uptime can be calculated in multiple ways. <br>
+As it is calculated on <u>15 minutes intervals</u> and alarms happen at the
+<u>minute-level</u>, within an interval of 15 minutes <b>there can be different
+combinations of alarms</b>.<br> For instance, we may set alarm = 1 if there
+was at least 1 alarm within the 15 minutes interval. However, this has
+strong implications for uptime calculations and almost no device would
+have a unptime \<97% (I provide the code below for this, but do not use
+this definition). <br> An alternative, is to set alarms = 1 if a minimum
+number of alarms happens within each interval. I use a total of 15
+alarms per device-interval (if Alarms1+Alarms2 \>= 15--\> Alarms = 1) as
+it is approximately the half alarms number we can have on an interval.
+<b>This is discretionary and can be modified.</b>
+
+```{r}
+# Aggregate by ID and interval
+# 2 options for the calculation of alarms: 1) if any alarm-->TRUE; 2) if more than half alarms--> TRUE
+
+# option 1)
+aggregated_data_NO <- data %>%
+  group_by(ID, day, interval) %>%
+  summarise(
+    alarms = any(Alarms1 != 0 | Alarms2 != 0,na.rm=T),
+    maintenance_alarm = any(Alarms1 == 16,na.rm=T),
+    missing = all(is.na(PanelVoltage_mV) & is.na(Position_a1_rad) & is.na(MotorCurrent_a1_mA) & is.na(MotorCurrentPeak_a1_mA) & is.na(TargetAngle_a1_rad) & is.na(PanelCurrent_mA) & is.na(MaxError) & is.na(StateOfCharge) & is.na(Voltage_mV) & is.na(StateOfHealth) & is.na(MainState) & is.na(SafePositionState))
+  )
+# option 2):
+aggregated_data <- data %>%
+  group_by(ID, day, interval) %>%
+  summarise(
+    alarms = sum(Alarms1 != 0 | Alarms2 != 0, na.rm=T) >= 15, #counts instances of alarm 1 or 2 different from zero, if >= 15 TRUE, o.w FALSE
+    maintenance_alarm = any(Alarms1 == 16, na.rm = T), # if any alarm1=16 TRUE, o.w FALSE
+    missing = all(is.na(PanelVoltage_mV) & is.na(Position_a1_rad) & is.na(MotorCurrent_a1_mA) & is.na(MotorCurrentPeak_a1_mA) & is.na(TargetAngle_a1_rad) & is.na(PanelCurrent_mA) & is.na(MaxError) & is.na(StateOfCharge) & is.na(Voltage_mV) & is.na(StateOfHealth) & is.na(MainState) & is.na(SafePositionState))#if all vars is.na TRUE, FALSE o.w.
+  )
+print(aggregated_data)
+```
+
+Dataframe for uptime calculation:
+```{r}
+#option 1) 
+uptime_components_NO <- aggregated_data_NO %>%
+  group_by(ID) %>%
+  summarise(
+    total_intervals = n(),
+    missing_intervals = sum(missing, na.rm = T),
+    alarm_intervals = sum(alarms, na.rm = T),
+    maintenance_alarm_intervals = sum(maintenance_alarm, na.rm = T)
+  ) %>%
+  mutate(
+    uptime = 100 * (1 - ((missing_intervals + alarm_intervals - maintenance_alarm_intervals) / total_intervals))
+  )
+#option 2)
+uptime_components <- aggregated_data %>%
+  group_by(ID) %>%
+  summarise(
+    total_intervals = n(),
+    missing_intervals = sum(missing, na.rm = T),
+    alarm_intervals = sum(alarms, na.rm = T),
+    maintenance_alarm_intervals = sum(maintenance_alarm, na.rm = T)
+  ) %>%
+  mutate(
+    downtime = 100 * ((missing_intervals + alarm_intervals - maintenance_alarm_intervals) / total_intervals)
+  ) %>%
+  mutate(uptime = 100 - downtime)
+
+uptime_components
+```
+
+Here I show how different definitions of uptime can lead to different
+situations. <br>
+
+```{r, fig.align = "center", fig.height = 8, fig.width = 12, out.width = "12.5in"}
+# Create a barplot or histogram
+p0 <- ggplot(uptime_components_NO, aes(x = factor(uptime < 97), fill = factor(uptime < 97))) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.5, size = 3) + # Add labels on top of bars
+  xlab("Uptime < 97%") + # Set x-axis label
+  ylab("Count") + # Set y-axis label
+  theme_clean() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 16), # Center and increase title size
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12)
+  ) + # Adjust size of x-axis label
+  ggtitle("Uptime distribution - Definition 1 (disregarded)")
+
+p1 <- ggplot(uptime_components, aes(x = factor(uptime < 97), fill = factor(uptime < 97))) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.5, size = 3) + # Add labels on top of bars
+  xlab("Uptime < 97%") + # Set x-axis label
+  ylab("Count") + # Set y-axis label
+  theme_clean() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 16), # Center and increase title size
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12)
+  ) + # Adjust size of x-axis label
+  ggtitle("Uptime distribution - Definition 2 (adopted)")
+
+p0 + p1
+```
+
+Adopting the second definition, across the 3 gateways, there are 264
+devices divided by uptime values above or below 97.<br> Below I show
+uptime distribution. <br> Aside from an outlier (device 3_121), uptime
+is concentrated between 80% and 99%, with median clos to 99%.
+
+```{r}
+# Plot uptime distribution
+ggplot(data = uptime_components, aes(x = "", y = uptime)) +
+  geom_boxplot(fill = "skyblue", color = "black") + # Customize boxplot appearance
+  xlab("Uptime") + # Remove x-axis label
+  ylab("(%)") + # Set y-axis label
+  theme_clean() + # Apply minimal theme
+  theme(
+    panel.grid.major = element_blank(), # Remove major gridlines
+    panel.grid.minor = element_blank()
+  ) + # Remove minor gridlines
+  ggtitle("Uptime Distribution (n=264 devices)") # Add title
+```
+
+```{r}
+table <- data.frame(
+  Uptime = c("<97%", ">= 97%"),
+  Devices_number = c(sum(uptime_components$uptime < 97), sum(uptime_components$uptime >= 97))
+)
+
+total <- c(
+  "Total",
+  sum(as.numeric(table$Devices_number))
+)
+table <- rbind(table, total)
+```
+
+<li><b>Identify devices with uptime \< 97%</b></li>
+
+```{r}
+table
+```
+
+```{r}
+# Select devices with uptime<97%
+devices_bad <- uptime_components %>%
+  filter(uptime < 97) %>%
+  pull(ID)
+
+
+# Filter data based on bad IDs
+devices_bad <- data %>%
+  filter(ID %in% devices_bad) %>%
+  filter(!is.na(ID))
+```
+
+<li><b>For devices with uptime \< 97%, identify most frequent
+alarms</b></li>
+
+We have 2 alarms variables, I identify the two most frequent alarms on
+each of the variables by aggregating the dataset with uptime\<97%
+devices by two new variables.<br> They represent the most 2 frequent
+alarms for Alarms1 and Alarms2 and I call them top_al1, top_al2. <br>
+<b> IMPORTANT:</b> I disregard Alarms_1 or Alarms_2 = 0 (as they do not
+constitute alarm code).<br> You can see that for Alarms_2 in most cases
+the most frequent and unique alarm code is Alarms_2 = 0. In those cases
+top_al2 is NA.
+
+```{r}
+# Group by ID and summarize the two most frequent non-zero values for Alarms1 and Alarms2
+aggregated_data <- devices_bad %>%
+  group_by(ID) %>%
+  summarise(
+    top_al1 = names(sort(table(Alarms1[Alarms1 != 0]), decreasing = TRUE)[1:2]),
+    top_al2 = {
+      non_zero_alarms2 <- Alarms2[Alarms2 != 0]
+      if (length(unique(non_zero_alarms2)) >= 2) {
+        names(sort(table(non_zero_alarms2), decreasing = TRUE)[1:2])
+      } else {
+        NA
+      }
+    }
+  )
+aggregated_data
+```
+
+```{r}
+# Calculate the frequency of each alarm type by device ID
+alarm_frequency_1 <- devices_bad %>%
+  group_by(ID, Alarms1) %>%
+  count(name = "Alarms1_frequency") %>%
+  filter(!Alarms1 == 0)
+# Restrict to the most frequent two alarms
+top_alarms1 <- alarm_frequency_1 %>%
+  group_by(ID, Alarms1) %>%
+  summarise(total_frequency = sum(Alarms1_frequency)) %>%
+  arrange(desc(total_frequency)) %>%
+  slice(1:2)
+
+# Calculate the frequency of each alarm type by device ID
+alarm_frequency_2 <- devices_bad %>%
+  group_by(ID, Alarms2) %>%
+  count(name = "Alarms2_frequency") %>%
+  filter(!Alarms2 == 0)
+
+# Restrict to the most frequent two alarms
+top_alarms2 <- alarm_frequency_2 %>%
+  group_by(ID, Alarms2) %>%
+  summarise(total_frequency = sum(Alarms2_frequency)) %>%
+  arrange(desc(total_frequency)) %>%
+  slice(1:2)
+
+# Adjust single instances. 3_121 is a particular case because is the only case it has 2 top alarms from Alarms2
+# Remove one observation from top_alarms1
+top_alarms1 <- top_alarms1 %>%
+  filter(!(Alarms1 == 128 & ID == "3_121"))
+
+# Remove one observation from top_alarms2
+top_alarms2 <- top_alarms2 %>%
+  filter(!(Alarms2 == 4 & ID == "3_121"))
+```
+
+```{r}
+top_alarms1
+```
+
+```{r}
+top_alarms2
+```
+
+Next, join top_alarms1 and 2 into a single dataframe. Create a column
+for top alarm type and for its "order". <br> Order means whether the
+alarm is the most frequent or the second most frequent, by device.
+
+</ol>
+
+```{r}
+merged <- merge(top_alarms1, top_alarms2, by = "ID", all.x = T)
+# identify top alarms
+merged <- merged %>%
+  mutate(top_alarms = ifelse(is.na(Alarms2), Alarms1,
+    ifelse(total_frequency.x > total_frequency.y, Alarms1, Alarms2)
+  ))
+
+merged <- merged %>%
+  group_by(ID) %>%
+  mutate(order = row_number()) %>%
+  arrange(ID, order)
+
+merged_tab <- merged
+colnames(merged_tab) <- c("ID", "Alarms1 (type)", "Frequency Alarm1 (count)", "Alarms2 (type)", "Frequency Alarms 2 (count)", "Most frequent alarm (type)", "Top 1 or 2")
+# View the result
+merged_tab
+```
+
+### Results visualization
+
+Some descriptive statistics <br> 92% of most frequent alarms are codes:
+8192; 4096. <br> <b> CAREFUL: </b> The number of devices with uptime
+\<97% is 127. Thus, the total absolute frequency should be (127\*2)=254
+(times 2 because we are looking at the 2 most common errors).<br> The
+slight discrepancy with the total value in the table is given by the
+fact that not all devices have a second most frequent alarm (e.g. some
+devices may show only codes 0 and another between 8192 or 4096).
+
+```{r}
+# Calculate absolute frequency of each alarm
+absolute_frequency <- table(merged$top_alarms) # total frequency
+
+# Calculate percentages of each top_alarms factor
+percentages <- absolute_frequency / nrow(merged) * 100 # total frequency percentages
+
+# Create a data frame with percentages and absolute frequencies
+result <- data.frame(
+  Top_alarms = as.integer(names(percentages)),
+  Absolute_frequency = as.integer(absolute_frequency),
+  Percentage = round(as.numeric(percentages), 2)
+)
+
+# Add a total line
+total <- c(
+  "Total",
+  sum(as.numeric(result$Absolute_frequency)),
+  round(sum(as.numeric(result$Percentage)), 0)
+)
+result <- rbind(result, total)
+
+result
+```
+
+### Identifying most problematic devices
+
+Next plots show:<br> 1) Devices with the highest number of alarms among
+those with uptime\<97; <br> 2) Devices with the highest downtime;<br> As
+downtime is not just equal to the number of alarms it is reasonable to
+have differences between the devices identified in the two plots
+
+```{r, fig.align = "center", fig.height = 8, fig.width = 12, out.width = "12.5in"}
+
+freq <- merge(alarm_frequency_1, alarm_frequency_2, by = "ID", all.x = T) # merge frequencies of all alarms in devices with uptime <97%
+freq <- freq %>%
+  group_by(ID) %>%
+  mutate(total_freq1_2 = sum(Alarms1_frequency, Alarms2_frequency, na.rm = T)) %>% # create a variable for the sum of all alarms( total alarms frequency)
+  select(ID, total_freq1_2) %>% # restrict interest columns
+  distinct(ID, total_freq1_2) %>% # filter unique entries
+  arrange(-total_freq1_2) %>%
+  ungroup() %>% # order dataset by descending order
+  mutate(total_freq1_2_perc = 100 * (total_freq1_2 / sum(total_freq1_2)))
+total <- c("Total", sum(freq$total_freq1_2), sum(freq$total_freq1_2_perc))
+freq <- rbind(freq, total)
+freq <- freq %>%
+  mutate(total_freq1_2 = as.numeric(total_freq1_2)) %>%
+  mutate(total_freq1_2_perc = as.numeric(total_freq1_2_perc))
+
+
+plot1 <- uptime_components %>%
+  arrange(desc(downtime)) %>%
+  slice_head(n = 20) %>%
+  ggplot(aes(x = reorder(ID, -downtime), y = downtime, fill = ID)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = paste0(round(downtime, 1), "%")), vjust = -0.5, size = 2.5) +
+  labs(x = "Device ID", y = "Downtime (%)", title = "20 Devices with highest downtime") +
+  theme_clean() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    legend.position = "none"
+  )
+
+
+plot2 <- ggplot(freq[1:20, ], aes(x = reorder(ID, -total_freq1_2), y = total_freq1_2, fill = ID)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = paste0(round(total_freq1_2_perc, 1), "%")), vjust = -0.5, size = 2.5) +
+  labs(x = "Device ID", y = "Count = #Alarms 1 + #Alarms 2", title = "20 Devices (uptime <97%) with highest nr. of alarms") +
+  theme_clean() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    legend.position = "none"
+  )
+
+plot1 + plot2
+```
+
+#### A heatmap-like plot
+
+This plot shows the most common two alarms by device ID. <br> It allows
+to identify for each device its most common alarm, allowing direct
+intervention.<br> In red is the most frequent alarm per device, in
+yellow is the second most frequent alarm.
+
+```{r, fig.align = "center", fig.height = 8, fig.width = 12, out.width = "12.5in"}
+# This chunk contains transformations necessary to plot a heatma-like plot
+# Convert relevant columns to factors
+merged$ID <- factor(merged$ID)
+merged$top_alarms <- factor(merged$top_alarms)
+
+
+# Create presence matrix
+presence_matrix <- table(merged$ID, merged$top_alarms)
+
+# Convert the presence matrix to a data frame
+presence_df <- as.data.frame.matrix(presence_matrix)
+
+# Reshape data for ggplot
+presence_df <- presence_df %>%
+  rownames_to_column(var = "ID") %>%
+  pivot_longer(cols = -ID, names_to = "top_alarms", values_to = "Presence")
+
+presence_df <- presence_df %>%
+  mutate(order = ifelse(ID %in% merged$ID & top_alarms %in% merged$top_alarms,
+    merged$order[match(paste(ID, top_alarms), paste(merged$ID, merged$top_alarms))],
+    NA
+  ))
+
+# Ensure 'Presence' is treated as a factor
+presence_df$Presence <- factor(presence_df$Presence, levels = c(0, 1), labels = c("Absent", "Present"))
+
+
+
+a <- ggplot(presence_df, aes(x = ID, y = top_alarms, fill = ifelse(is.na(order), "Not observed", ifelse(order == "1", "Top1 Alarm", "Top2 Alarm")))) +
+  geom_tile(color = "white") +
+  scale_fill_manual(values = c("Not observed" = "white", "Top1 Alarm" = "red", "Top2 Alarm" = "yellow"), name = "Alarms") +
+  theme_minimal() +
+  labs(x = "ID", y = "Top Alarms", title = "Presence of Top Alarms by ID when uptime < 97%") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 5)) +
+  geom_hline(yintercept = seq(0.5, nrow(presence_df) + 0.5, by = 1), color = "gray", linetype = "dashed")
+
+# Center the plot
+
+ggplotly(a)
+```
+
+### What associates mostly to Alarm1?
+
+Alarm1 is the most frequent type of alarm. As a first step in the
+direction of a predictive maintenance model, it might be interesting
+understanding which are the variables associated the most to its
+manifestation.<br> <b> This is a very raw and preliminary attempt. </b>
+
+#### Boruta & features importance: another way to look at correlations
+
+Simply put, Boruta variables' importance explains the degree to which an
+input contributes to the prediction of the output. More important
+variables are thus more related to othe output.<br> At a first sight,
+the (battery) State of Charge is the most impactful variable on the
+manifestation of Alarms1.
+
+```{r, fig.align = "center", fig.height = 5, fig.width = 8, out.width = "8.5in"}
+boruta_data<-data
+#Drop NA
+boruta_data<- na.omit(boruta_data)
+
+#Transform alarm1 into a binary variable: If = NO ALARM; != 0 any other alarm
+boruta_data<-boruta_data%>%
+  mutate(Alarms1 = as.factor(ifelse(Alarms1 == 0, 0, 1)),
+         MainState = as.factor(MainState),
+         StateOfHealth = as.factor(StateOfHealth),
+         SafePositionState = as.factor(SafePositionState)
+  )
+         
+
+#Select relevant variaable for inputs
+boruta_data<-boruta_data[,c(6,8:dim(boruta_data)[2])]
+#Boruta selector
+set.seed(1)
+boruta <- Boruta(boruta_data$Alarms1 ~ . ,data= boruta_data,  doTrace = 2, maxRuns = 100)
+boruta <- plot(boruta, las = 2, cex.axis = 0.5, xlab = "")
+boruta
+```
+
